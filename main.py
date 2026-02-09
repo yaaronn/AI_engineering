@@ -1,51 +1,111 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form, Request
+from fastapi.responses import HTMLResponse
+from fastapi.templating import Jinja2Templates
 import pandas as pd
 import os
+from groq import Groq
+from dotenv import load_dotenv
+
+load_dotenv()
+client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 app = FastAPI()
+templates = Jinja2Templates(directory="templates")
 
-DATA_PATH = "data/sales.csv"
+DATA_PATH = "data/uploaded.csv"
+
+chat_memory = []
+
+@app.get("/chat", response_class=HTMLResponse)
+def chat_page(request: Request):
+    return templates.TemplateResponse("chat.html", {"request": request})
 
 
-# 1. Test route
-@app.get("/")
-def home():
-    return {"message": "AI Engineer API is running 🚀"}
-
-
-# 2. Upload CSV
-@app.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+@app.post("/upload", response_class=HTMLResponse)
+async def upload_file(request: Request, file: UploadFile = File(...)):
     os.makedirs("data", exist_ok=True)
 
     with open(DATA_PATH, "wb") as f:
         f.write(await file.read())
 
-    df = pd.read_csv(DATA_PATH)
-    return {"rows": len(df), "columns": list(df.columns)}
+    return templates.TemplateResponse(
+        "chat.html",
+        {"request": request, "answer": "File uploaded successfully! Ask a question."}
+    )
 
 
-# 3. View all sales
-@app.get("/sales")
-def get_sales(product: str = None):
+@app.post("/ask", response_class=HTMLResponse)
+async def ask_question(request: Request, question: str = Form(...)):
+    global chat_memory
+
     if not os.path.exists(DATA_PATH):
-        return {"error": "Upload a file first"}
+        return templates.TemplateResponse(
+            "chat.html",
+            {"request": request, "answer": "Upload a dataset first."}
+        )
 
     df = pd.read_csv(DATA_PATH)
 
-    if product:
-        df = df[df["product"] == product]
+    # store user message
+    #chat_memory.append({"role": "user", "content": question})
 
-    return df.to_dict(orient="records")
+    messages = [
+    {
+        "role": "system",
+        "content": f"""
+You are a Python pandas data analyst.
+
+You must write executable Python code only.
+
+Rules:
+- dataframe name is df
+- columns are {list(df.columns)}
+- final output must be stored in variable 'result'
+- no explanations
+- no conversation
+- no markdown
+"""
+    }
+] + chat_memory
 
 
-# 4. Calculate revenue
-@app.get("/revenue")
-def revenue():
-    if not os.path.exists(DATA_PATH):
-        return {"error": "Upload a file first"}
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=messages
+    )
 
-    df = pd.read_csv(DATA_PATH)
-    total = (df["price"] * df["quantity"]).sum()
+    code = response.choices[0].message.content
 
-    return {"total_revenue": float(total)}
+    # remove markdown
+    if "```" in code:
+        code = code.split("```")[1]
+        if code.startswith("python"):
+            code = code[len("python"):]
+
+    code = code.strip()
+
+    try:
+        local_vars = {"df": df}
+        exec(code, {}, local_vars)
+        result = local_vars.get("result", "No result produced")
+    except Exception as e:
+        result = f"Execution error: {str(e)}"
+
+    explain = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "Explain simply"},
+            {"role": "user", "content": str(result)}
+        ]
+    )
+
+    answer = explain.choices[0].message.content
+
+    # store AI reply
+    chat_memory.append({"role": "assistant", "content": answer})
+
+    return templates.TemplateResponse(
+        "chat.html",
+        {"request": request, "answer": answer}
+    )
+
